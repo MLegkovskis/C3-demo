@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS pressure (
+    id SERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    pressure FLOAT NOT NULL
+);
