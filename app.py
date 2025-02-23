@@ -1,3 +1,7 @@
+# ----------------------------------------------------------------
+# File: app.py
+# ----------------------------------------------------------------
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,22 +9,28 @@ import psycopg2
 import plotly.graph_objs as go
 import datetime
 
-from sklearn.linear_model import LinearRegression
-from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor
+# Statsmodels for Fourier Regression & confidence intervals
+import statsmodels.api as sm
 
 from streamlit_autorefresh import st_autorefresh
 
 # ----------------------------------------------------------------
+# Constants (hard-coded)
+SMOOTHING_WINDOW = 3
+SEASONAL_PERIOD = 100
+NUM_HARMONICS = 3
+
+# ----------------------------------------------------------------
 # Auto-refresh every 5 seconds (for live DB updates, if any)
-st_autorefresh(interval=5000, key="datarefresh")
+st_autorefresh(interval=1000, key="datarefresh")
 
 # ----------------------------------------------------------------
 # Title and brief description
 st.title("How Machine Learning Can Help in an Industrial Setting: Time Series Demo")
 st.markdown("""
-This demo shows how ML models can be applied to **reservoir pressure data** with seasonal patterns.
-We simulate spikes and apply models that capture sinusoidal behavior via Fourier features.
+This demo shows how a **Fourier-based regression** can be applied to **reservoir pressure data** 
+with seasonal patterns. We simulate spikes and apply a model that captures sinusoidal behavior 
+via Fourier features.
 """)
 
 # ----------------------------------------------------------------
@@ -51,17 +61,14 @@ def get_connection():
 conn = get_connection()
 
 # ----------------------------------------------------------------
-# Sidebar: Controls
+# Sidebar: Only Forecast Horizon
 st.sidebar.title("Options & Controls")
-
-smoothing_window = st.sidebar.slider("Smoothing Window (# data points)", 
-                                     min_value=1, max_value=10, value=3)
-forecast_horizon = st.sidebar.slider("Forecast Horizon (# future readings)", 
-                                     min_value=1, max_value=2000, value=10)
-seasonal_period = st.sidebar.slider("Seasonal Period (# readings)", 
-                                    min_value=1, max_value=1000, value=24)
-num_harmonics = st.sidebar.slider("Number of Fourier Harmonics", 
-                                  min_value=1, max_value=10, value=3)
+forecast_horizon = st.sidebar.slider(
+    "Forecast Horizon (# future readings)", 
+    min_value=1, 
+    max_value=2000, 
+    value=10
+)
 
 # Buttons: Simulate spike or normalize
 if st.sidebar.button("Simulate Pressure Spike"):
@@ -105,10 +112,10 @@ else:
         df.loc[df['id'] >= st.session_state.spike_start_reading, 'pressure'] += st.session_state.cumulative_adjustment
 
     # Smoothing
-    df['smoothed_pressure'] = df['pressure'].rolling(window=smoothing_window, min_periods=1).mean()
+    df['smoothed_pressure'] = df['pressure'].rolling(window=SMOOTHING_WINDOW, min_periods=1).mean()
 
     # ------------------------------------------------------------
-    # Training data
+    # Prepare training data
     X_raw = df[['id']].values
     y = df['pressure'].values
 
@@ -120,7 +127,8 @@ else:
     # Fourier feature creation
     def create_fourier_features(X, period, num_harmonics):
         """
-        Return columns: [X, sin(1x), cos(1x), sin(2x), cos(2x), ..., sin(kx), cos(kx)]
+        Return columns: [1, X, sin(1x), cos(1x), sin(2x), cos(2x), ..., sin(kx), cos(kx)]
+        We'll add a constant later via statsmodels, so we won't add it here.
         """
         X = X.ravel()
         features = [X]  # keep raw ID as a feature
@@ -129,34 +137,25 @@ else:
             features.append(np.cos(2.0 * np.pi * k * X / period))
         return np.column_stack(features)
 
-    X_fourier = create_fourier_features(X_raw, seasonal_period, num_harmonics)
-    future_fourier = create_fourier_features(future_readings, seasonal_period, num_harmonics)
+    X_fourier = create_fourier_features(X_raw, SEASONAL_PERIOD, NUM_HARMONICS)
+    future_fourier = create_fourier_features(future_readings, SEASONAL_PERIOD, NUM_HARMONICS)
 
     # ------------------------------------------------------------
-    # Define models (no plain Linear Regression)
-    models = {
-        "SVR (RBF)": SVR(kernel='rbf', C=100, epsilon=0.1),
-        "Random Forest": RandomForestRegressor(n_estimators=100, random_state=42),
-        "Fourier Regression": LinearRegression(),  # A simple linear model on Fourier features
-    }
+    # Single Model: Fourier Regression with statsmodels
 
-    colors = {
-        "SVR (RBF)": "green",
-        "Random Forest": "purple",
-        "Fourier Regression": "orange"
-    }
+    # 1) Add constant column for intercept
+    X_fourier_sm = sm.add_constant(X_fourier)
+    future_fourier_sm = sm.add_constant(future_fourier)
 
-    # ------------------------------------------------------------
-    # Train each model & predict
-    predictions = {}
-    for name, model in models.items():
-        try:
-            model.fit(X_fourier, y)
-            y_pred = model.predict(future_fourier)
-            predictions[name] = y_pred
-        except Exception as e:
-            st.error(f"Error training model {name}: {e}")
-            predictions[name] = np.zeros(forecast_horizon)
+    # 2) Fit model
+    model = sm.OLS(y, X_fourier_sm).fit()
+
+    # 3) Predict + confidence intervals
+    forecast_res = model.get_prediction(future_fourier_sm)
+    y_pred_mean = forecast_res.predicted_mean
+    conf_int = forecast_res.conf_int(alpha=0.05)  # 95% CI
+    y_pred_lower = conf_int[:, 0]
+    y_pred_upper = conf_int[:, 1]
 
     # ------------------------------------------------------------
     # Plotly figure
@@ -177,26 +176,37 @@ else:
         x=df['id'],
         y=df['smoothed_pressure'],
         mode='lines',
-        name=f"Smoothed (Window={smoothing_window})",
+        name=f"Smoothed (Window={SMOOTHING_WINDOW})",
         line=dict(color='black', width=3)
     ))
 
-    # Predictions (smooth lines, no dashes)
-    for name, y_pred in predictions.items():
-        fig.add_trace(go.Scatter(
-            x=future_readings.flatten(),
-            y=y_pred,
-            mode='lines',
-            name=name,
-            line=dict(color=colors[name], width=3),
-            line_shape='spline'  # makes the line look smoothly curved
-        ))
+    # Fourier Regression Mean
+    fig.add_trace(go.Scatter(
+        x=future_readings.flatten(),
+        y=y_pred_mean,
+        mode='lines',
+        name="Fourier Regression",
+        line=dict(color='orange', width=3),
+        line_shape='spline'
+    ))
+
+    # Confidence Interval (fill between lower/upper)
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([future_readings.flatten(), future_readings.flatten()[::-1]]),
+        y=np.concatenate([y_pred_upper, y_pred_lower[::-1]]),
+        fill='toself',
+        fillcolor='rgba(255, 165, 0, 0.2)',  # orange w/ transparency
+        line=dict(color='rgba(255, 165, 0, 0)'),
+        hoverinfo="skip",
+        showlegend=False,
+        name='Confidence Interval'
+    ))
 
     fig.update_layout(
-        title=f"Industrial-Grade Time Series Predictions: Next {forecast_horizon} Readings",
+        title=f"Industrial-Grade Time Series Prediction (Fourier Regression): Next {forecast_horizon} Readings",
         xaxis_title="Reading Number",
         yaxis_title="Pressure",
-        legend_title="Data & Predictions",
+        legend_title="Data & Prediction",
         template="plotly_white"
     )
 
