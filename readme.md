@@ -1,7 +1,5 @@
 # C3 Demo: Industrial Time Series ML App
 
-This repository contains a minimal end-to-end demonstration of **machine learning applied to time series data** in an industrial setting. We simulate **reservoir pressure** readings, store them in a PostgreSQL database, and visualize & predict future pressures using **Streamlit**.
-
 
 ![image](https://github.com/user-attachments/assets/93139cbb-ce12-45bf-a3c0-fb0fca4f0631)
 
